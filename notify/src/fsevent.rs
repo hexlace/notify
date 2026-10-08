@@ -523,6 +523,28 @@ extern "C" fn callback(
     }
 }
 
+/// Whether an event at `path` belongs to one of the watched paths in
+/// `recursive_info`: the path is watched itself, its parent is watched, or
+/// one of its ancestors is watched recursively.
+///
+/// The path and its ancestors are looked up by hash rather than scanning
+/// every watched path, so deciding an event costs one lookup per component
+/// of its path, however many paths are watched. The callback runs this for
+/// every event FSEvents delivers, and a scan of every watch slows delivery
+/// in proportion to how many there are.
+fn is_watched(recursive_info: &HashMap<PathBuf, bool>, path: &Path) -> bool {
+    if recursive_info.contains_key(path) {
+        return true;
+    }
+    path.ancestors()
+        .skip(1)
+        .enumerate()
+        .any(|(depth, ancestor)| match recursive_info.get(ancestor) {
+            Some(&recursive) => recursive || depth == 0,
+            None => false,
+        })
+}
+
 unsafe fn callback_impl(
     _stream_ref: fs::FSEventStreamRef,
     info: *mut libc::c_void,
@@ -546,22 +568,7 @@ unsafe fn callback_impl(
             panic!("Unable to decode StreamFlags: {}", flag);
         });
 
-        let mut handle_event = false;
-        for (p, r) in &(*info).recursive_info {
-            if path.starts_with(p) {
-                if *r || &path == p {
-                    handle_event = true;
-                    break;
-                } else if let Some(parent_path) = path.parent() {
-                    if parent_path == p {
-                        handle_event = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if !handle_event {
+        if !is_watched(&(*info).recursive_info, &path) {
             continue;
         }
 
@@ -610,6 +617,103 @@ impl Drop for FsEventWatcher {
         self.stop();
         unsafe {
             cf::CFRelease(self.paths);
+        }
+    }
+}
+
+#[test]
+fn test_is_watched_matches_each_kind_of_watch() {
+    let mut recursive_info = HashMap::new();
+    recursive_info.insert(PathBuf::from("/repo"), false);
+    recursive_info.insert(PathBuf::from("/repo/src"), false);
+    recursive_info.insert(PathBuf::from("/deep"), true);
+    recursive_info.insert(PathBuf::from("/single/file.txt"), false);
+
+    let cases = [
+        // A watched path itself, recursive or not.
+        ("/repo", true),
+        ("/deep", true),
+        ("/single/file.txt", true),
+        // A direct child of a non-recursive watch.
+        ("/repo/readme.md", true),
+        ("/repo/src/main.rs", true),
+        // A grandchild of a non-recursive watch whose own parent is unwatched.
+        ("/repo/target/debug", false),
+        // Any descendant of a recursive watch.
+        ("/deep/a", true),
+        ("/deep/a/b/c", true),
+        // A sibling sharing a prefix of characters, not of components.
+        ("/repository/readme.md", false),
+        ("/deeper/a", false),
+        // The parent of a watched file, and its other children.
+        ("/single", false),
+        ("/single/other.txt", false),
+        // Nothing watched above it at all.
+        ("/elsewhere/x", false),
+        ("/", false),
+    ];
+    for (path, expected) in cases {
+        assert_eq!(
+            is_watched(&recursive_info, Path::new(path)),
+            expected,
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn test_is_watched_agrees_with_a_scan_of_every_watch() {
+    // The decision a scan of every watched path makes, which `is_watched`
+    // replaces: kept here as the reference it must agree with.
+    fn scan(recursive_info: &HashMap<PathBuf, bool>, path: &Path) -> bool {
+        recursive_info.iter().any(|(watched, &recursive)| {
+            path.starts_with(watched)
+                && (recursive || path == watched || path.parent() == Some(watched.as_path()))
+        })
+    }
+
+    let watches: [(&str, bool); 6] = [
+        ("/a", false),
+        ("/a/b", true),
+        ("/a/b/c", false),
+        ("/x/y", false),
+        ("/x/y/z.txt", false),
+        ("/r", true),
+    ];
+    let paths = [
+        "/",
+        "/a",
+        "/a/b",
+        "/a/b/c",
+        "/a/b/c/d",
+        "/a/b/c/d/e",
+        "/a/z",
+        "/a/z/q",
+        "/ab",
+        "/x",
+        "/x/y",
+        "/x/y/z.txt",
+        "/x/y/w",
+        "/x/y/w/v",
+        "/r",
+        "/r/s/t",
+        "/rs",
+    ];
+    // Every subset of the watches, so each path is judged against watches
+    // that are recursive, non-recursive, nested in each other and absent.
+    for mask in 0u32..(1 << watches.len()) {
+        let recursive_info: HashMap<PathBuf, bool> = watches
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| mask & (1 << index) != 0)
+            .map(|(_, &(watched, recursive))| (PathBuf::from(watched), recursive))
+            .collect();
+        for path in paths {
+            assert_eq!(
+                is_watched(&recursive_info, Path::new(path)),
+                scan(&recursive_info, Path::new(path)),
+                "{path} against {recursive_info:?}"
+            );
         }
     }
 }
