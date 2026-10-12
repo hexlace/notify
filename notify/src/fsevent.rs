@@ -641,19 +641,46 @@ fn is_watched(recursive_info: &HashMap<PathBuf, bool>, path: &Path) -> bool {
         })
 }
 
+/// The order to hand on one callback's events in: the indices of `event_ids`,
+/// ordered by event id, with events of equal id kept in delivery order.
+///
+/// FSEvents documents event ids as increasing, and says nothing about the
+/// order a callback's array is in. It has been seen to deliver an event
+/// ahead of one with a lower id in the same callback, with no flag on either,
+/// when several processes write inside the watched paths. A handler that
+/// treats an event as a marker, everything before which has been seen, would
+/// then miss the earlier event that came after it.
+///
+/// Ids don't always follow the order changes were made in, either: a change
+/// can be numbered after a later change made by another process. Sorting
+/// can't correct that, and doesn't try. It assumes only that where a
+/// callback's array and its ids disagree, the ids are right, which held in
+/// every such case measured. It orders only the events of one callback, which
+/// have all been delivered: nothing is held back for a later one.
+fn delivery_order(event_ids: &[fs::FSEventStreamEventId]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..event_ids.len()).collect();
+    order.sort_by_key(|&index| event_ids[index]);
+    order
+}
+
 unsafe fn callback_impl(
     _stream_ref: fs::FSEventStreamRef,
     info: *mut libc::c_void,
     num_events: libc::size_t,                        // size_t numEvents
     event_paths: *mut libc::c_void,                  // void *eventPaths
     event_flags: *const fs::FSEventStreamEventFlags, // const FSEventStreamEventFlags eventFlags[]
-    _event_ids: *const fs::FSEventStreamEventId,     // const FSEventStreamEventId eventIds[]
+    event_ids: *const fs::FSEventStreamEventId,      // const FSEventStreamEventId eventIds[]
 ) {
+    if num_events == 0 {
+        return;
+    }
     let event_paths = event_paths as *const *const libc::c_char;
     let info = info as *const StreamContextInfo;
     let event_handler = &(*info).event_handler;
+    // Safety: FSEvents hands the callback `num_events` ids, which outlive it.
+    let event_ids = std::slice::from_raw_parts(event_ids, num_events);
 
-    for p in 0..num_events {
+    for p in delivery_order(event_ids) {
         let path = CStr::from_ptr(*event_paths.add(p))
             .to_str()
             .expect("Invalid UTF8 string.");
@@ -936,10 +963,25 @@ fn test_every_loss_notice_becomes_a_rescan() {
 }
 
 /// Drives the callback itself with `delivered`, each a path and its flags, as
-/// the arrays FSEvents hands it, against non-recursive watches on `watched`,
-/// and returns every event the handler was given.
+/// the arrays FSEvents hands it with ids in delivery order, against
+/// non-recursive watches on `watched`, and returns every event the handler
+/// was given.
 #[cfg(test)]
 fn events_the_callback_hands_on(watched: &[&str], delivered: &[(&str, StreamFlags)]) -> Vec<Event> {
+    let with_ids: Vec<(&str, StreamFlags, fs::FSEventStreamEventId)> = delivered
+        .iter()
+        .zip(1..)
+        .map(|((path, flags), id)| (*path, StreamFlags::from_bits_truncate(flags.bits()), id))
+        .collect();
+    events_the_callback_hands_on_with_ids(watched, &with_ids)
+}
+
+/// As [`events_the_callback_hands_on`], with each delivered event's id given.
+#[cfg(test)]
+fn events_the_callback_hands_on_with_ids(
+    watched: &[&str],
+    delivered: &[(&str, StreamFlags, fs::FSEventStreamEventId)],
+) -> Vec<Event> {
     use std::ffi::CString;
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -952,12 +994,12 @@ fn events_the_callback_hands_on(watched: &[&str], delivered: &[(&str, StreamFlag
     };
     let paths: Vec<CString> = delivered
         .iter()
-        .map(|(path, _)| CString::new(*path).expect("a path without a nul"))
+        .map(|(path, _, _)| CString::new(*path).expect("a path without a nul"))
         .collect();
     let path_pointers: Vec<*const libc::c_char> = paths.iter().map(|path| path.as_ptr()).collect();
     let flags: Vec<fs::FSEventStreamEventFlags> =
-        delivered.iter().map(|(_, flags)| flags.bits()).collect();
-    let ids = vec![0; delivered.len()];
+        delivered.iter().map(|(_, flags, _)| flags.bits()).collect();
+    let ids: Vec<fs::FSEventStreamEventId> = delivered.iter().map(|(_, _, id)| *id).collect();
     // Safety: every array holds `delivered.len()` elements and outlives the
     // call, and `info` is the `StreamContextInfo` the callback expects.
     unsafe {
@@ -1022,6 +1064,41 @@ fn test_the_callback_hands_on_only_the_rescan_of_a_notice_at_an_unwatched_path()
     assert_eq!(events.len(), 1, "the handler was given {events:?}");
     assert!(events[0].need_rescan(), "the handler was given {events:?}");
     assert_eq!(events[0].paths, [PathBuf::from("/vol")]);
+}
+
+/// A callback whose array holds an event ahead of one with a lower id, as
+/// FSEvents delivers when several processes write: a marker file's create,
+/// made after a source file was written, comes first. The handler is given
+/// them in id order, so the source file's event is never behind the marker.
+#[test]
+fn test_the_callback_hands_on_its_events_in_event_id_order() {
+    let file = || StreamFlags::ITEM_CREATED | StreamFlags::IS_FILE;
+    let events = events_the_callback_hands_on_with_ids(
+        &["/vol/repo", "/vol/repo/cookies"],
+        &[
+            ("/vol/repo/cookies/1", file(), 30),
+            ("/vol/repo/a.rs", file(), 10),
+            ("/vol/repo/b.rs", file(), 20),
+        ],
+    );
+
+    let paths: Vec<&PathBuf> = events.iter().flat_map(|event| &event.paths).collect();
+    assert_eq!(
+        paths,
+        [
+            Path::new("/vol/repo/a.rs"),
+            Path::new("/vol/repo/b.rs"),
+            Path::new("/vol/repo/cookies/1"),
+        ],
+        "the handler was given {events:?}"
+    );
+}
+
+#[test]
+fn test_events_of_equal_id_keep_their_delivery_order() {
+    assert_eq!(delivery_order(&[]), Vec::<usize>::new());
+    assert_eq!(delivery_order(&[7, 3, 7, 3, 9]), [1, 3, 0, 2, 4]);
+    assert_eq!(delivery_order(&[1, 2, 3]), [0, 1, 2]);
 }
 
 #[test]
