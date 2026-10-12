@@ -130,9 +130,10 @@ const STREAM_LOSS_NOTICES: StreamFlags = StreamFlags::USER_DROPPED
 enum Forwarding {
     /// Every event the flags translate to: the event's path is watched.
     All,
-    /// Only the rescan: a loss notice at a path nothing watches. Any
-    /// ordinary flags it carries describe a path the handler was never
-    /// asked about, which the path filter would have dropped.
+    /// Only the rescan: a loss notice handed on for its loss alone, at a
+    /// path nothing watches. Any ordinary flags it carries describe a path
+    /// the handler was never asked about, which the path filter would have
+    /// dropped.
     RescanOnly,
     /// Nothing: the event says nothing about any watch.
     Nothing,
@@ -147,12 +148,12 @@ enum Forwarding {
 /// chooses, which need not be one that was watched. A drop or a wrap
 /// ([`STREAM_LOSS_NOTICES`]) always hands on its rescan. A notice about a
 /// subtree hands on its rescan when a watch lies at or below its path (`/`,
-/// a volume's root, any ancestor of a watch). A notice at an unwatched path
-/// hands on its rescan alone, and the ordinary flags beside it are dropped
-/// as any event at that path would be. A notice that touches no watch, and
-/// every ordinary event at an unwatched path, hands on nothing: it lies
-/// wholly in a part of the tree no watch reports, and stands only for
-/// events the handler would not have been given anyway.
+/// a volume's root, any ancestor of a watch). Either, handed on at an
+/// unwatched path, hands on its rescan alone, and the ordinary flags beside
+/// it are dropped as any event at that path would be. A notice that
+/// touches no watch, and every ordinary event at an unwatched path, hands on
+/// nothing: it lies wholly in a part of the tree no watch reports, and
+/// stands only for events the handler would not have been given anyway.
 fn forwarding(
     recursive_info: &HashMap<PathBuf, bool>,
     path: &Path,
