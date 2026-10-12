@@ -92,6 +92,72 @@ unsafe impl Send for FsEventWatcher {}
 // It's Sync because all methods that change the mutable state use `&mut self`.
 unsafe impl Sync for FsEventWatcher {}
 
+/// The flags with which FSEvents says that events a stream would have
+/// reported were lost, coalesced or can no longer be told apart, so that a
+/// handler must look at the file system again instead of trusting what it
+/// was told. Each reaches the handler as a rescan (`translate_flags`).
+///
+/// - `MUST_SCAN_SUBDIRS` (`kFSEventStreamEventFlagMustScanSubDirs`): events
+///   below the event's path were coalesced or dropped, and that subtree must
+///   be scanned again.
+/// - `USER_DROPPED` (`kFSEventStreamEventFlagUserDropped`): events were
+///   dropped in user space, before they reached this stream's client.
+/// - `KERNEL_DROPPED` (`kFSEventStreamEventFlagKernelDropped`): the kernel's
+///   queue overflowed and events were dropped before `fseventsd` saw them.
+/// - `IDS_WRAPPED` (`kFSEventStreamEventFlagEventIdsWrapped`): the event id
+///   counter wrapped, so ids issued before it no longer order against those
+///   issued after.
+/// - `ROOT_CHANGED` (`kFSEventStreamEventFlagRootChanged`): a watched path or
+///   one of its ancestors was moved, removed or replaced, so the path no
+///   longer names what was watched.
+const LOSS_NOTICES: StreamFlags = StreamFlags::MUST_SCAN_SUBDIRS
+    .union(StreamFlags::USER_DROPPED)
+    .union(StreamFlags::KERNEL_DROPPED)
+    .union(StreamFlags::IDS_WRAPPED)
+    .union(StreamFlags::ROOT_CHANGED);
+
+/// The loss notices that say something about the whole stream rather than
+/// one subtree: a drop or a wrap loses events wherever they were, so the
+/// path FSEvents puts on one (often `/`, or a volume's root) says nothing
+/// about which watches it touched.
+const STREAM_LOSS_NOTICES: StreamFlags = StreamFlags::USER_DROPPED
+    .union(StreamFlags::KERNEL_DROPPED)
+    .union(StreamFlags::IDS_WRAPPED);
+
+/// Decides whether an event FSEvents delivered at `path` with `flags` is
+/// handed to the event handler, against the watches in `recursive_info`.
+///
+/// An ordinary event is handed on when its path is watched ([`is_watched`]).
+/// A notice that the stream's history was lost ([`LOSS_NOTICES`]) is never
+/// decided by that alone, because FSEvents puts it on whatever path it
+/// chooses, which need not be one that was watched. A drop or a wrap
+/// ([`STREAM_LOSS_NOTICES`]) is always handed on. A notice about a subtree
+/// is handed on when [`is_watched`] would hand on an event at its path, or
+/// a watch lies at or below that path (`/`, a volume's root, any ancestor of
+/// a watch). One that does neither lies wholly in a part of the tree no
+/// watch reports, and stands only for events the handler would not have
+/// been given anyway.
+fn is_forwarded(recursive_info: &HashMap<PathBuf, bool>, path: &Path, flags: &StreamFlags) -> bool {
+    if flags.intersects(STREAM_LOSS_NOTICES) {
+        return true;
+    }
+    if is_watched(recursive_info, path) {
+        return true;
+    }
+    flags.intersects(LOSS_NOTICES) && has_a_watch_at_or_below(recursive_info, path)
+}
+
+/// Whether some watched path in `recursive_info` is `path` or lies below it.
+///
+/// Scans every watch, unlike [`is_watched`], because "is anything below
+/// this" is not a lookup in a map keyed by path; it runs only for a loss
+/// notice that [`is_watched`] did not already settle, which is rare.
+fn has_a_watch_at_or_below(recursive_info: &HashMap<PathBuf, bool>, path: &Path) -> bool {
+    recursive_info
+        .keys()
+        .any(|watched| watched.starts_with(path))
+}
+
 fn translate_flags(flags: StreamFlags, precise: bool) -> Vec<Event> {
     let mut evs = Vec::new();
 
@@ -109,16 +175,22 @@ fn translate_flags(flags: StreamFlags, precise: bool) -> Vec<Event> {
         return evs;
     }
 
-    // FSEvents provides two possible hints as to why events were dropped,
-    // however documentation on what those mean is scant, so we just pass them
-    // through in the info attr field. The intent is clear enough, and the
-    // additional information is provided if the user wants it.
-    if flags.contains(StreamFlags::MUST_SCAN_SUBDIRS) {
+    // Every notice that the stream's history can no longer be trusted
+    // becomes one rescan, whichever of them it carries: a drop is normally
+    // reported with `MUST_SCAN_SUBDIRS` beside it, but nothing guarantees
+    // that, and a notice that reached the handler as no event at all would
+    // be a loss the handler is never told of. The hint FSEvents gives is
+    // passed through in the info attr field.
+    if flags.intersects(LOSS_NOTICES) {
         let e = Event::new(EventKind::Other).set_flag(Flag::Rescan);
         evs.push(if flags.contains(StreamFlags::USER_DROPPED) {
             e.set_info("rescan: user dropped")
         } else if flags.contains(StreamFlags::KERNEL_DROPPED) {
             e.set_info("rescan: kernel dropped")
+        } else if flags.contains(StreamFlags::IDS_WRAPPED) {
+            e.set_info("rescan: event ids wrapped")
+        } else if flags.contains(StreamFlags::ROOT_CHANGED) {
+            e.set_info("rescan: root changed")
         } else {
             e
         });
@@ -568,7 +640,7 @@ unsafe fn callback_impl(
             panic!("Unable to decode StreamFlags: {}", flag);
         });
 
-        if !is_watched(&(*info).recursive_info, &path) {
+        if !is_forwarded(&(*info).recursive_info, &path, &flag) {
             continue;
         }
 
@@ -716,6 +788,110 @@ fn test_is_watched_agrees_with_a_scan_of_every_watch() {
             );
         }
     }
+}
+
+/// The watches the forwarding tests decide against: a non-recursive watch
+/// on a tree and one of its directories, and a recursive one elsewhere.
+#[cfg(test)]
+fn forwarding_watches() -> HashMap<PathBuf, bool> {
+    HashMap::from([
+        (PathBuf::from("/vol/repo"), false),
+        (PathBuf::from("/vol/repo/src"), false),
+        (PathBuf::from("/deep"), true),
+    ])
+}
+
+#[test]
+fn test_a_drop_or_a_wrap_is_forwarded_whatever_its_path() {
+    let watches = forwarding_watches();
+    for flags in [
+        StreamFlags::USER_DROPPED,
+        StreamFlags::KERNEL_DROPPED,
+        StreamFlags::IDS_WRAPPED,
+        StreamFlags::MUST_SCAN_SUBDIRS | StreamFlags::USER_DROPPED,
+        StreamFlags::MUST_SCAN_SUBDIRS | StreamFlags::KERNEL_DROPPED,
+    ] {
+        for path in ["/", "/vol", "/elsewhere/x", "/vol/repo/target/debug"] {
+            assert!(
+                is_forwarded(&watches, Path::new(path), &flags),
+                "{flags:?} at {path} was not forwarded"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_a_subtree_notice_is_forwarded_when_its_subtree_touches_a_watch() {
+    let watches = forwarding_watches();
+    for flags in [StreamFlags::MUST_SCAN_SUBDIRS, StreamFlags::ROOT_CHANGED] {
+        // Above every watch: the volume, and an ancestor of the tree.
+        for path in ["/", "/vol"] {
+            assert!(
+                is_forwarded(&watches, Path::new(path), &flags),
+                "{flags:?} at {path}, above a watch, was not forwarded"
+            );
+        }
+        // A watched path, a direct child of a non-recursive watch, and a
+        // descendant of a recursive one.
+        for path in ["/vol/repo", "/vol/repo/src", "/vol/repo/new", "/deep/a/b"] {
+            assert!(
+                is_forwarded(&watches, Path::new(path), &flags),
+                "{flags:?} at {path}, a watched path, was not forwarded"
+            );
+        }
+        // Wholly in a part no watch reports: a grandchild of a non-recursive
+        // watch with nothing watched below it, and a tree watched by nothing.
+        for path in ["/vol/repo/target/debug", "/elsewhere", "/vol/other"] {
+            assert!(
+                !is_forwarded(&watches, Path::new(path), &flags),
+                "{flags:?} at {path}, touching no watch, was forwarded"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_an_ordinary_event_is_forwarded_only_when_its_path_is_watched() {
+    let watches = forwarding_watches();
+    let flags = StreamFlags::ITEM_CREATED | StreamFlags::IS_FILE;
+    for path in ["/vol/repo/a.rs", "/vol/repo/src/b.rs", "/deep/a/b/c.rs"] {
+        assert!(
+            is_forwarded(&watches, Path::new(path), &flags),
+            "an event at watched {path} was not forwarded"
+        );
+    }
+    // Above every watch, an ancestor of one, and in a part no watch reports:
+    // an ordinary event is filtered by its path, whatever lies below it.
+    for path in ["/", "/vol", "/vol/repo/target/debug/x.o", "/elsewhere/x"] {
+        assert!(
+            !is_forwarded(&watches, Path::new(path), &flags),
+            "an event at unwatched {path} was forwarded"
+        );
+    }
+}
+
+#[test]
+fn test_every_loss_notice_becomes_a_rescan() {
+    for flags in [
+        StreamFlags::MUST_SCAN_SUBDIRS,
+        StreamFlags::USER_DROPPED,
+        StreamFlags::KERNEL_DROPPED,
+        StreamFlags::IDS_WRAPPED,
+        StreamFlags::ROOT_CHANGED,
+    ] {
+        let name = format!("{flags:?}");
+        let events = translate_flags(flags, true);
+        assert_eq!(
+            events.iter().filter(|event| event.need_rescan()).count(),
+            1,
+            "{name} became {events:?}"
+        );
+    }
+    let ordinary = translate_flags(StreamFlags::ITEM_CREATED | StreamFlags::IS_FILE, true);
+    assert!(
+        ordinary.iter().all(|event| !event.need_rescan()),
+        "an ordinary create became {ordinary:?}"
+    );
 }
 
 #[test]
