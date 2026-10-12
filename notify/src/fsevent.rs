@@ -117,9 +117,10 @@ const LOSS_NOTICES: StreamFlags = StreamFlags::MUST_SCAN_SUBDIRS
     .union(StreamFlags::ROOT_CHANGED);
 
 /// The loss notices that say something about the whole stream rather than
-/// one subtree: a drop or a wrap loses events wherever they were, so the
-/// path FSEvents puts on one (often `/`, or a volume's root) says nothing
-/// about which watches it touched.
+/// one subtree: a drop or a wrap loses events wherever they were. FSEvents
+/// reports a drop once for each path the stream watches, at that path (its
+/// header says so, and a user drop provoked on macOS 26.5 arrived that way),
+/// and documents no path for a wrap, so neither is filtered by its path.
 const STREAM_LOSS_NOTICES: StreamFlags = StreamFlags::USER_DROPPED
     .union(StreamFlags::KERNEL_DROPPED)
     .union(StreamFlags::IDS_WRAPPED);
@@ -891,6 +892,63 @@ fn test_every_loss_notice_becomes_a_rescan() {
     assert!(
         ordinary.iter().all(|event| !event.need_rescan()),
         "an ordinary create became {ordinary:?}"
+    );
+}
+
+/// Drives the callback itself, with the arrays FSEvents hands it, so that
+/// what decides forwarding there is tested and not only `is_forwarded`.
+/// A real stream will not coalesce on demand: a drop it can be made to
+/// report arrives at each watched path, which the filter before this one
+/// forwarded already.
+#[test]
+fn test_the_callback_forwards_a_subtree_notice_above_its_watch() {
+    use std::ffi::CString;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let info = StreamContextInfo {
+        event_handler: Arc::new(Mutex::new(tx)),
+        recursive_info: HashMap::from([(PathBuf::from("/vol/repo"), false)]),
+    };
+    let paths = ["/vol", "/vol/repo/target/debug", "/vol/repo/a.rs"]
+        .map(|path| CString::new(path).expect("a path without a nul"));
+    let path_pointers: Vec<*const libc::c_char> = paths.iter().map(|path| path.as_ptr()).collect();
+    let flags = [
+        StreamFlags::MUST_SCAN_SUBDIRS.bits(),
+        StreamFlags::MUST_SCAN_SUBDIRS.bits(),
+        (StreamFlags::ITEM_CREATED | StreamFlags::IS_FILE).bits(),
+    ];
+    let ids = [0; 3];
+    // Safety: every array holds `paths.len()` elements and outlives the
+    // call, and `info` is the `StreamContextInfo` the callback expects.
+    unsafe {
+        callback_impl(
+            ptr::null_mut(),
+            &info as *const StreamContextInfo as *mut libc::c_void,
+            paths.len(),
+            path_pointers.as_ptr() as *mut libc::c_void,
+            flags.as_ptr(),
+            ids.as_ptr(),
+        );
+    }
+    let events: Vec<Event> = rx
+        .try_iter()
+        .map(|event| event.expect("an event"))
+        .collect();
+
+    let rescans: Vec<&Event> = events.iter().filter(|event| event.need_rescan()).collect();
+    assert_eq!(rescans.len(), 1, "the handler was given {events:?}");
+    assert_eq!(rescans[0].paths, [PathBuf::from("/vol")]);
+    assert!(
+        events
+            .iter()
+            .any(|event| event.paths == [PathBuf::from("/vol/repo/a.rs")]),
+        "the create in the watch did not arrive: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.paths != [PathBuf::from("/vol/repo/target/debug")]),
+        "a notice touching no watch was forwarded: {events:?}"
     );
 }
 
