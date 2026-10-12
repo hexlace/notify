@@ -649,11 +649,14 @@ fn is_watched(recursive_info: &HashMap<PathBuf, bool>, path: &Path) -> bool {
 /// ahead of one with a lower id in the same callback, with no flag on either,
 /// when several processes write inside the watched paths. A handler that
 /// treats an event as a marker, everything before which has been seen, would
-/// then miss the earlier event that came after it. This assumes fseventsd
-/// assigns ids in the order it reads events from the kernel, so that id order
-/// is the order the changes were made in. It orders only the events of one
-/// callback, which have all been delivered: nothing is held back for a later
-/// one.
+/// then miss the earlier event that came after it.
+///
+/// Ids don't always follow the order changes were made in, either: a change
+/// can be numbered after a later change made by another process. Sorting
+/// can't correct that, and doesn't try. It assumes only that where a
+/// callback's array and its ids disagree, the ids are right, which held in
+/// every such case measured. It orders only the events of one callback, which
+/// have all been delivered: nothing is held back for a later one.
 fn delivery_order(event_ids: &[fs::FSEventStreamEventId]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..event_ids.len()).collect();
     order.sort_by_key(|&index| event_ids[index]);
